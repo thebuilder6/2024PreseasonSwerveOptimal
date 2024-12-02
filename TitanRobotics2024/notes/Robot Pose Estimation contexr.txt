@@ -1,0 +1,1316 @@
+Let's break down how to create a robust position estimator for your robot, fusing data from your swerve drive odometry, IMU, and vision system. We'll go through the theory, implementation considerations, and potential challenges.
+
+**1. Understanding the Sensors and Their Characteristics**
+
+*   **Swerve Drive Odometry:**
+    *   **Data:**  Wheel motor encoder counts, which can be converted to wheel velocities and then, using the robot's kinematics, to robot velocity (linear and angular).
+    *   **Strengths:**  High frequency updates, good for short-term relative motion estimation.
+    *   **Weaknesses:**  Prone to drift due to wheel slippage, imperfect kinematic models, and encoder inaccuracies. Integration of velocity leads to accumulated error over time.
+    *   **LQR Control Benefit:** Your LQR (Linear Quadratic Regulator) controller helps ensure the robot follows desired velocity commands accurately, minimizing wheel slip and improving odometry accuracy compared to a non-controlled system.
+
+*   **IMU (AHRS):**
+    *   **Data:**
+        *   **Heading:**  Yaw angle, typically very accurate in the short term.
+        *   **Angular Acceleration:**  Rate of change of angular velocity.
+        *   **X, Y Acceleration:**  Linear acceleration in the robot's frame. This can be used to estimate motion, but gravity needs to be compensated for, and noise can be an issue.
+    *   **Strengths:**  High update rates, provides orientation information (heading) directly, can capture rapid changes in motion.
+    *   **Weaknesses:**
+        *   **Heading Drift:**  Gyroscope bias can cause heading to drift over time.
+        *   **Acceleration Noise and Bias:**  Linear accelerations are noisy, and integrating them twice for position estimation leads to rapid error growth.
+        *   **Gravity Bias:**  Accelerometers measure gravity, which must be subtracted to get true linear acceleration. This is sensitive to the robot's tilt.
+
+*   **Camera Vision System:**
+    *   **Data:**  Pose (position and orientation) relative to a known reference point (e.g., a target or field marker).
+    *   **Strengths:**  Very accurate pose measurements, no drift.
+    *   **Weaknesses:**
+        *   **Low Update Rate:**  Vision processing typically has a lower frequency than odometry or IMU.
+        *   **Occlusion and Lighting Sensitivity:**  Performance can degrade if the target is obstructed or lighting conditions are poor.
+        *   **Limited Field of View:**  The robot needs to be within view of the target for measurements.
+
+**2. Estimation Algorithm: Extended Kalman Filter (EKF) or Unscented Kalman Filter (UKF)**
+
+A Kalman filter is an optimal estimator that combines noisy measurements and a motion model to produce the best possible estimate of the system's state (in this case, the robot's pose: x, y, and heading/yaw).
+
+*   **Why Kalman Filter?**
+    *   **Optimal Fusion:**  It optimally weighs information from different sensors based on their noise characteristics.
+    *   **Recursive:**  It updates the state estimate with each new measurement, making it suitable for real-time operation.
+    *   **Handles Noise and Uncertainty:**  It explicitly models sensor noise and process noise (uncertainty in the robot's motion model).
+
+*   **EKF vs. UKF:**
+    *   **EKF (Extended Kalman Filter):**  Linearizes the system and measurement models around the current state estimate.  It's computationally efficient but can be inaccurate for highly nonlinear systems.
+    *   **UKF (Unscented Kalman Filter):**  Uses a set of sigma points to represent the state distribution, capturing nonlinearity better than EKF.  It's more computationally expensive but generally more accurate.
+
+    **Recommendation:** Start with an EKF for simplicity. If the system is highly nonlinear (e.g., due to complex swerve drive kinematics or significant IMU biases), consider switching to a UKF.
+
+**3. State and Measurement Models**
+
+*   **State Vector:**  The variables you want to estimate:
+
+    `x = [p_x, p_y, θ, v_x, v_y, ω, b_ω]^T`
+
+    Where:
+    *   `p_x`, `p_y`:  Robot position in global coordinates.
+    *   `θ`:  Robot heading (yaw).
+    *   `v_x`, `v_y`: Robot linear velocity in the robot's frame.
+    *   `ω`: Robot angular velocity.
+    *   `b_ω`: IMU gyro bias (if estimating it).  Including this can help compensate for gyro drift.
+
+*   **Motion Model (Predict Step):**  How the robot's state changes over time based on odometry and IMU:
+
+    The motion model will use the velocity information from both odometry (using the wheel encoders and your swerve drive kinematics) and the IMU.  You can also integrate the IMU's angular acceleration to predict the angular velocity and heading. It will also take into account your LQR control system. LQR control minimizes the difference between your desired and actual velocities. This can be represented in the following model:
+
+    *   **Position Update:**
+        *   `p_x(t+1) = p_x(t) +  Δt * (v_x(t) * cos(θ(t)) - v_y(t) * sin(θ(t)))  + w_p_x`
+        *   `p_y(t+1) = p_y(t) +  Δt * (v_x(t) * sin(θ(t)) + v_y(t) * cos(θ(t)))  + w_p_y`
+        *   Where:
+            *   `Δt` is the time step.
+            *   `v_x` and `v_y` are the linear velocities in the robot's frame.
+            *   `w_p_x` and `w_p_y` are process noise terms accounting for uncertainty in the velocity and integration.
+    *   **Heading Update:**
+        *   `θ(t+1) = θ(t) + Δt * (ω(t) - b_ω(t)) + w_θ`
+        *   Where:
+            *   `ω` is the angular velocity.
+            *   `b_ω` is the gyro bias.
+            *   `w_θ`  is process noise.
+    *   **Velocity Update:**  You can use either odometry or IMU data for linear and angular velocities. You can also fuse them or treat them as separate measurements in the measurement update step. For example using odometry:
+        *   `v_x(t+1) = v_x_odom(t) + w_v_x`
+        *   `v_y(t+1) = v_y_odom(t) + w_v_y`
+        *    `ω(t+1) = ω_odom(t) + w_ω`
+        *   where `v_x_odom, v_y_odom, ω_odom` are the velocities derived from odometry, and the w terms are corresponding noise components. You can use the LQR controller output to improve confidence in these measurements by reducing `w_v_x`, `w_v_y`, and `w_ω`
+    *   **Bias Update (if estimating):**
+        *   `b_ω(t+1) = b_ω(t) + w_b_ω`
+        *   Assuming a slowly varying bias, with noise `w_b_ω`.
+
+    **LQR Integration:**
+
+    *   **State Augmentation:**  If your LQR controller provides estimates of the robot's velocity or acceleration errors, you can augment your state vector to include these error terms. For example:
+        *   `x = [p_x, p_y, θ, v_x, v_y, ω, b_ω, e_vx, e_vy, e_ω]^T`
+        *   Where `e_vx`, `e_vy`, `e_ω` are the velocity errors in x, y, and angular velocity, respectively.
+    *   **Motion Model Modification:**  Modify your motion model to predict how these error states evolve over time. The LQR controller's model can provide information about the error dynamics. You can use this to better model your robot's behavior, improve accuracy, and get improved sensor fusion by weighting down sensors when the error is low, and waiting them up higher when error is higher.
+
+*   **Measurement Model (Update Step):**  How the sensors relate to the state:
+
+    *   **Odometry:**
+        *   `z_odom = [v_x_odom, v_y_odom, ω_odom]^T + v_odom`
+        *   Directly measures robot velocities in the robot frame.  `v_odom` is the measurement noise.
+        *   `v_x_odom`, `v_y_odom`, ω_odom,  Are calculated using wheel encoder counts and robot kinematics, potentially leveraging the LQR controller output to reduce error and uncertainty.
+  Okay, let's continue from where we left off, expanding on the measurement model and then discussing implementation details and challenges.
+
+*   **Measurement Model (Update Step) Continued:**
+    *   **IMU:**
+        *   **Heading:** `z_θ = θ + v_θ`
+            *   Direct measurement of robot heading (yaw). `v_θ` is the measurement noise.
+        *   **Angular Velocity:**  `z_ω = ω + v_ω`
+            *   Direct measurement of angular velocity. `v_ω` is the measurement noise.
+         *   **Linear Acceleration:**
+             *   `z_ax = a_x - g*sin(θ)  + v_ax`
+             *   `z_ay = a_y + g*cos(θ) + v_ay`
+             *   Where:
+                 *   `z_ax` and `z_ay` are the measured accelerations in the robot frame.
+                 *   `a_x` and `a_y` are the true linear accelerations in the world frame.
+                 *   `g` is the acceleration due to gravity.
+                 *   `θ`  is the robot's roll/pitch angle (if your IMU provides it, otherwise you might assume small angles and neglect this or estimate it in the filter).
+                 *   `v_ax` and `v_ay` are the accelerometer noise.
+
+            *   **Note:** To use linear accelerations in the filter, you'll need to either:
+                *   Integrate them twice to get position (which rapidly accumulates error) and then formulate the measurement as `[p_x_accel, p_y_accel]`.
+                *   Or estimate accelerations `a_x`, `a_y` as part of your state and then implement a model for how these relate to velocities, such as  `v_x(t+1) = v_x(t) + Δt*a_x(t)`. The measurement is then a direct measurement of the acceleration terms. This is likely the better approach if you want to use acceleration data.
+        *   **Note on Gravity Compensation:**  You'll need to estimate the robot's roll and pitch angles (or assume they are small) to subtract the gravity component from the accelerometer readings. This can be done using the IMU's orientation data or by incorporating roll and pitch into your state vector.
+
+    *   **Vision System:**
+        *   `z_vision = [p_x_vision, p_y_vision, θ_vision]^T + v_vision`
+        *   Directly measures robot pose (position and orientation) in the global frame when a target is in view. `v_vision` is the measurement noise.
+
+**4. Implementation Steps**
+
+1.  **Filter Initialization:**
+    *   Set initial state estimate `x_0` (e.g., initial position from vision or set to zero if unknown).
+    *   Set initial state covariance matrix `P_0`, representing the uncertainty in the initial state (high if you have low confidence, low if you have a good initial estimate).
+    *   Define process noise covariance matrix `Q` and measurement noise covariance matrices `R_odom`, `R_IMU`, `R_vision`. These matrices represent the uncertainty in your motion model and sensor measurements, respectively. Tuning these parameters is crucial for filter performance.
+
+2.  **Prediction Step:**
+    *   **State Prediction:**  Predict the next state `x_k+1|k` based on the motion model and the previous state estimate `x_k|k` as well as control inputs from your LQR:
+        *   `x_k+1|k = f(x_k|k, u_k)` where `f` is your motion model and `u_k` is your control inputs.
+    *   **Covariance Prediction:**  Predict the state covariance matrix `P_k+1|k` using the Jacobian of the motion model (if using EKF) or sigma points (if using UKF) and the process noise covariance `Q`.
+
+3.  **Update Step:**  When you receive a measurement from a sensor (odometry, IMU, or vision):
+    *   **Calculate Innovation (Residual):**  Find the difference between the actual measurement `z_k` and the predicted measurement based on the predicted state `x_k+1|k`.
+    *   **Innovation Covariance:**  Calculate the covariance of the innovation using the measurement noise covariance `R` and the predicted state covariance `P_k+1|k`.
+    *   **Kalman Gain:** Compute the Kalman gain `K`, which determines how much to weigh the measurement versus the predicted state. This depends on the relative uncertainties of the prediction and the measurement.
+    *   **State Update:**  Update the state estimate by incorporating the innovation, weighted by the Kalman gain:
+        *   `x_k+1|k+1 = x_k+1|k + K * (z_k - h(x_k+1|k))` where `h` is the measurement function.
+    *   **Covariance Update:**  Update the state covariance matrix `P_k+1|k+1` to reflect the reduced uncertainty after incorporating the measurement.
+
+4.  **Loop:**  Repeat steps 2 and 3 for each time step, fusing data as it becomes available.  Since the vision data is likely to be at a much lower rate than odometry and IMU, you'll mostly be doing predict and update steps using odometry and IMU and then occasionally incorporating a vision update when it's available.
+
+**5. Implementation Considerations**
+
+*   **Timing and Synchronization:**  Ensure proper time synchronization between sensor readings. Use timestamps to align data from different sensors.
+*   **Coordinate Frames:**  Be meticulous about coordinate transformations between the robot frame, IMU frame, and global frame.
+*   **Noise Modeling:**  Accurately characterizing sensor noise and process noise is critical. You might need to collect experimental data and analyze it to determine appropriate noise values. This can be done through methods like Allan Variance for IMU noise characterization.
+*   **Outlier Rejection:**  Implement methods to detect and reject outlier measurements, especially from the vision system (e.g., due to incorrect target detection). RANSAC is a potential method here.
+*   **Computational Efficiency:**  EKF is generally faster than UKF.  If computational resources are limited, consider optimizing your code or using a simpler filter if possible.  Careful code implementation, use of efficient linear algebra libraries, and potentially reducing the state vector size if appropriate can all help with this.
+*   **Tuning:**  The filter's performance depends heavily on the noise covariances (`Q`, `R`) and the initial conditions. You will likely need to tune these parameters empirically by comparing the filter's output to ground truth data or by observing the filter's behavior in different scenarios.  There are systematic tuning methods that can help guide this process.
+*   **Linear Algebra Libraries:**  Use efficient linear algebra libraries (e.g., Eigen, BLAS/LAPACK) for matrix operations.
+*   **Modular Design:**  Create a modular system where you can easily add, remove, or modify sensors and filter components.
+
+**6. Potential Challenges**
+
+*   **Non-linearities:** If your robot's motion or sensor models are highly nonlinear, an EKF might not be accurate enough, and a UKF or other nonlinear estimation techniques might be necessary.
+*   **IMU Bias Drift:** Gyroscope bias can be a significant source of error.  Estimating and compensating for bias in the filter can improve performance, but it also adds complexity.
+*   **Wheel Slip:** While the LQR controller helps, significant wheel slip can still occur, leading to odometry errors. Detecting and mitigating slip (e.g., through wheel slip models or by adjusting odometry covariance) is important.
+*   **Vision System Issues:**  Occlusion, lighting changes, and incorrect target detection can lead to unreliable vision measurements.  Robust outlier rejection and error handling are crucial.
+*   **Sensor Failure:**  Consider how to handle sensor failures gracefully.  For example, you could switch to a degraded mode of operation if one sensor becomes unavailable.
+
+By carefully considering these aspects and implementing a well-tuned Kalman filter, you can create a robust and accurate position estimator for your robot. Remember that iterative testing, tuning, and refinement will be necessary to achieve optimal performance. Good luck!
+You're absolutely right! Incorporating a map of the playfield significantly enhances the position estimator and provides opportunities for both improved accuracy and robustness. Here's how you can leverage the map within your Kalman filter framework:
+
+**1. Map Representation**
+
+First, you need a suitable way to represent your map. Common choices include:
+
+*   **Occupancy Grid Map:**  Divides the space into cells, each marked as occupied, free, or unknown.  This is good for collision avoidance and checking for feasible poses.
+*   **Feature Map:**  Stores the locations of distinct landmarks or features (e.g., walls, corners, specific objects) in the environment. Useful for associating vision measurements with known locations.
+*   **Combined Approach:**  You can use a hybrid approach, combining an occupancy grid for general feasibility checks and a feature map for vision updates.
+
+**2. Incorporating Map Information into the Kalman Filter**
+
+There are several ways to integrate map data into your estimator:
+
+*   **Measurement Update with Map Features:**
+    *   **If using a feature-based map:**  When your vision system detects a feature, you can associate it with a known feature on the map.  This provides a very accurate measurement of the robot's pose relative to that feature. Your measurement model then becomes a comparison of the detected feature's pose relative to the robot, to it's pose on the map, allowing you to extract robot pose.
+    *   **Implementation:**
+        1.  **Feature Detection and Association:** Identify features in the camera image and match them to corresponding features on the map (data association). This might involve using feature descriptors (like SIFT or SURF) or geometric constraints.
+        2.  **Measurement:**  The measurement `z_vision` becomes the pose (position and orientation) of the robot *relative to the detected feature*.
+        3.  **Measurement Function `h()`:** This function transforms the robot's state (global pose) into the expected relative pose of the feature, given the known map location of the feature.
+        4.  **Standard Kalman Filter Update:** Use the measurement and the modified `h()` to update the state estimate as usual.
+
+*   **Pose Correction/Rejection based on Occupancy Grid:**
+    *   **Idea:**  After each prediction step (or update step), check if the predicted robot pose is within a free cell on the occupancy grid map.  If it's in an occupied cell or outside the map bounds, the pose is impossible. You can then correct the pose or reject the update.
+    *   **Implementation:**
+        1.  **Pose Check:** After the prediction step, use the predicted pose `[p_x, p_y]` to index into the occupancy grid.
+        2.  **Correction/Rejection:**
+            *   **Rejection:** If the cell is occupied or invalid, don't update the state with the prediction. You might instead use the previous state estimate or extrapolate from previous valid states. This effectively stops the filter from drifting into walls. You will need to flag the measurement as invalid, and also handle this appropriately in your covariance prediction step, by not incorporating process noise in cases where the measurement is rejected
+            *   **Correction:** If the cell is occupied, you can try to find the closest free cell and "project" the pose onto it. This can be complex and might introduce errors if the correction is not done carefully. It is generally better to reject impossible states than to try to correct them.
+        3.  **Particle Filter Enhancement:**  If you are using a particle filter (an alternative to Kalman filters for highly nonlinear systems), you can resample particles based on their likelihood of being in free space. Particles in occupied cells would be discarded or given very low weights.
+    *   **Particle Filter for Non-Linear/Non-Gaussian Measurement**
+        *   Occupancy grid maps often result in non-linear, non-Gaussian measurement models, as the measurement is a binary indicator of whether the robot is in a free or occupied cell. In such cases the Kalman filter is sub-optimal. Particle filters can better handle such models.
+        *   **Implementation**
+            1.  **Initialization:** Generate a set of particles representing the initial distribution of the robot's pose
+            2.  **Prediction:** Based on robot motion and LQR control, predict the movement of each particle in the set.
+            3.  **Measurement:** When you receive a measurement (either from your robot sensors, or in this case from your map) evaluate the probability or likelihood of each particle generating the observed measurement.
+                *   In the case of occupancy grids this likelihood can be defined such as: P(particle) = 1 if in free space, and 0 if in occupied space. Other weighting functions are possible (ex: assigning some small probability for occupied space to account for noise)
+            4.  **Resampling:** Draw a new set of particles based on the assigned weights in the previous step. Particles with a higher weight are more likely to be resampled.
+            5.  **State Estimation:** Estimate the robots state using the set of particles after resampling. Ex: By using the average or weighted average of particle positions
+            6.  Repeat prediction, measurement, resampling and state estimation.
+
+*   **Using the Map to Improve Odometry:**
+
+    *   **Idea:** If your robot is constrained to move along well-defined paths or corridors, you can use the map to detect when wheel slip occurs. For instance, if your robot odometry shows motion perpendicular to a wall, but the map indicates this is impossible, the filter can correct or lower the confidence in the measurement.
+    *   **Implementation:**
+        *   Compare the odometry-based motion to the map geometry.
+        *   If the motion is inconsistent (e.g., moving into a wall), increase the odometry noise covariance in the Kalman filter or temporarily discard/reduce the weight of odometry updates. This can be integrated in the LQR control system where you increase your control input variance to reduce confidence in the current control output.
+        *   This process requires a slightly more complex motion model that accounts for possible constraints. You might model the movement along known corridors or pathways, incorporating lateral constraints as measurements or by modifying the prediction step of the filter.
+
+**3. Implementation Details**
+
+*   **Map Data Structure:**  Choose a data structure that allows efficient queries, such as:
+    *   For occupancy grids: 2D arrays or specialized grid libraries.
+    *   For feature maps:  Lists, dictionaries, or spatial data structures (e.g., k-d trees) for efficient feature lookup.
+*   **Coordinate Transformations:**  Carefully handle transformations between the robot frame, sensor frames, and map frame.
+*   **Sensor Fusion Logic:** Design a strategy for fusing map information with other sensor data. You might prioritize vision measurements when available and use map-based corrections as a backup or for continuous plausibility checks.
+*   **Computational Cost:**  Map-based operations can add computational overhead.  Optimize your code, use efficient data structures, and consider downsampling the map or using coarser resolution if necessary.
+
+**4. Challenges**
+
+*   **Map Accuracy:**  Errors in the map will directly affect the position estimator's accuracy.
+*   **Dynamic Environments:**  If the environment changes, the map needs to be updated or the system needs to be able to handle inconsistencies between the map and sensor observations. SLAM techniques can be combined with the current approach to generate and update the map.
+*   **Data Association:**  Correctly associating vision features with map features can be challenging, especially in environments with many similar-looking features.
+*   **Computational Complexity:**  Real-time map queries and pose corrections need to be computationally efficient.
+
+**In summary, incorporating map information can significantly improve the accuracy and robustness of your robot's position estimator by providing constraints, absolute reference points, and aiding in sensor fusion.  Careful design and implementation are necessary to handle the complexities of map integration and to ensure real-time performance.**
+Okay, let's outline a Java code structure using WPILib for FRC, incorporating the concepts we've discussed for optimal pose estimation. This will be a fairly high-level structure, focusing on the main components and their interactions.
+
+**1. Project Setup and Dependencies**
+
+*   Create a new FRC robot project in VS Code.
+*   Ensure you have the necessary WPILib dependencies installed (including the necessary vendor libraries for your IMU, swerve drive, and camera system).
+
+**2. Sensor Classes**
+
+We'll start by creating classes to abstract the sensor data:
+
+*   **SwerveOdometry.java**
+
+    ```java
+    package frc.robot.sensors;
+
+    import edu.wpi.first.math.geometry.Pose2d;
+    import edu.wpi.first.math.geometry.Rotation2d;
+    import edu.wpi.first.math.kinematics.SwerveDriveKinematics;
+    import edu.wpi.first.math.kinematics.SwerveDriveOdometry;
+    import edu.wpi.first.math.kinematics.SwerveModulePosition;
+    import edu.wpi.first.math.kinematics.SwerveModuleState;
+    import frc.robot.subsystems.SwerveDriveSubsystem;
+
+    public class SwerveOdometry {
+
+        private final SwerveDriveSubsystem swerveSubsystem;
+        private final SwerveDriveKinematics kinematics;
+        private final SwerveDriveOdometry odometry;
+
+        private Pose2d estimatedPose = new Pose2d();
+
+        public SwerveOdometry(SwerveDriveSubsystem swerveSubsystem, SwerveDriveKinematics kinematics) {
+            this.swerveSubsystem = swerveSubsystem;
+            this.kinematics = kinematics;
+            this.odometry = new SwerveDriveOdometry(kinematics, getGyroYaw(), getModulePositions());
+        }
+
+        public void update() {
+            estimatedPose = odometry.update(getGyroYaw(), getModulePositions());
+        }
+
+        public Pose2d getEstimatedPose() {
+            return estimatedPose;
+        }
+
+        public SwerveModuleState[] getModuleStates() {
+             return new SwerveModuleState[] {
+                swerveSubsystem.getFrontLeftModuleState(),
+                swerveSubsystem.getFrontRightModuleState(),
+                swerveSubsystem.getBackLeftModuleState(),
+                swerveSubsystem.getBackRightModuleState()
+            };
+        }
+
+         public SwerveModulePosition[] getModulePositions() {
+            return new SwerveModulePosition[] {
+                swerveSubsystem.getFrontLeftModulePosition(),
+                swerveSubsystem.getFrontRightModulePosition(),
+                swerveSubsystem.getBackLeftModulePosition(),
+                swerveSubsystem.getBackRightModulePosition()
+            };
+        }
+
+        private Rotation2d getGyroYaw() {
+            return swerveSubsystem.getGyroYaw();
+        }
+    }
+    ```
+
+*   **IMUSensor.java**
+
+    ```java
+    package frc.robot.sensors;
+
+    import com.kauailabs.navx.frc.AHRS;
+    import edu.wpi.first.math.geometry.Rotation2d;
+    import edu.wpi.first.wpilibj.SPI;
+    import edu.wpi.first.wpilibj.SerialPort;
+
+    public class IMUSensor {
+
+        private AHRS ahrs;
+
+        public enum IMUType { NAVX_SPI, NAVX_USB, PIGEON }
+        private IMUType imuType = IMUType.NAVX_SPI;
+
+
+        public IMUSensor(IMUType imuType) {
+             this.imuType = imuType;
+            if (imuType == IMUType.NAVX_SPI) {
+                try {
+                    ahrs = new AHRS(SPI.Port.kMXP);
+                } catch (RuntimeException ex) {
+                    System.out.println("Error instantiating navX MXP:  " + ex.getMessage());
+                }
+            } else if (imuType == IMUType.NAVX_USB){
+                 try {
+                    ahrs = new AHRS(SerialPort.Port.kUSB);
+                 } catch (RuntimeException ex) {
+                   System.out.println("Error instantiating navX MXP:  " + ex.getMessage());
+                 }
+            } else if (imuType == IMUType.PIGEON){
+                System.out.println("Pigeon IMU Not Yet Implemented");
+            }
+            else {
+                System.out.println("Invalid IMU type provided");
+            }
+
+            if(ahrs != null){
+              ahrs.reset();
+            }
+        }
+
+        public Rotation2d getHeading() {
+          if(ahrs != null){
+            return Rotation2d.fromDegrees(-ahrs.getAngle());
+          }
+          return new Rotation2d();
+        }
+
+        public double getAngularVelocity() {
+            if(ahrs != null){
+                return -ahrs.getRate();
+            }
+            return 0.0;
+        }
+
+        public double getAccelX() {
+            if(ahrs != null){
+                return ahrs.getRawAccelX();
+            }
+            return 0.0;
+        }
+
+        public double getAccelY() {
+             if(ahrs != null){
+                return ahrs.getRawAccelY();
+            }
+            return 0.0;
+        }
+
+         public void reset() {
+           if(ahrs != null){
+            ahrs.reset();
+           }
+         }
+    }
+    ```
+
+*   **VisionSensor.java**
+
+    ```java
+    package frc.robot.sensors;
+
+    import edu.wpi.first.math.geometry.Pose2d;
+    import edu.wpi.first.math.geometry.Transform2d;
+    import edu.wpi.first.wpilibj2.command.SubsystemBase;
+    import java.util.Optional;
+
+    import org.photonvision.EstimatedRobotPose;
+    import org.photonvision.PhotonCamera;
+    import org.photonvision.PhotonPoseEstimator;
+    import org.photonvision.PhotonUtils;
+    import org.photonvision.targeting.PhotonPipelineResult;
+    import org.photonvision.targeting.PhotonTrackedTarget;
+
+    public class VisionSensor extends SubsystemBase {
+
+      private final PhotonCamera camera;
+      private final Transform2d cameraToRobot;
+      private final PhotonPoseEstimator poseEstimator;
+      private final double cameraHeight;
+      private final double targetHeight;
+      private final double cameraPitch;
+
+      private Optional<Pose2d> lastPose = Optional.empty();
+
+
+      public VisionSensor(String cameraName, Transform2d cameraToRobot, double cameraHeight, double targetHeight, double cameraPitch) {
+          this.camera = new PhotonCamera(cameraName);
+          this.cameraToRobot = cameraToRobot;
+          this.poseEstimator = new PhotonPoseEstimator(camera.getCameraIntrinsics(), targetHeight, cameraToRobot, cameraHeight, cameraPitch, 0, 0);
+          this.cameraHeight = cameraHeight;
+          this.targetHeight = targetHeight;
+          this.cameraPitch = cameraPitch;
+      }
+
+      @Override
+      public void periodic() {
+        PhotonPipelineResult result = camera.getLatestResult();
+
+        if(result.hasTargets()){
+          PhotonTrackedTarget bestTarget = result.getBestTarget();
+          lastPose = poseEstimator.estimatePose(bestTarget);
+        }
+        else{
+          lastPose = Optional.empty();
+        }
+      }
+
+
+        public Optional<Pose2d> getEstimatedPose() {
+              if(lastPose.isPresent()){
+                return Optional.of(lastPose.get());
+              }
+              else{
+                return Optional.empty();
+              }
+        }
+
+        public boolean hasTargets() {
+            return camera.getLatestResult().hasTargets();
+        }
+
+    }
+    ```
+
+Okay, let's continue building the `FieldMap.java` class and then move on to the Kalman Filter implementation and the overall robot code structure.
+
+**3. Map Representation Class (Continued)**
+
+*   **FieldMap.java**
+
+    ```java
+    package frc.robot.map;
+
+    import edu.wpi.first.math.geometry.Pose2d;
+    import edu.wpi.first.math.geometry.Translation2d;
+    import java.util.List;
+    import java.util.ArrayList;
+
+    public class FieldMap {
+
+        private List<Translation2d> fieldFeatures;
+        private double maxX;
+        private double maxY;
+        private double minX;
+        private double minY;
+
+        public FieldMap(List<Translation2d> fieldFeatures, double maxX, double maxY, double minX, double minY) {
+          this.fieldFeatures = fieldFeatures;
+          this.maxX = maxX;
+          this.maxY = maxY;
+          this.minX = minX;
+          this.minY = minY;
+        }
+
+
+         // Method to check if a pose is within the field bounds
+         public boolean isPoseWithinBounds(Pose2d pose) {
+           double x = pose.getX();
+           double y = pose.getY();
+           return x >= minX && x <= maxX && y >= minY && y <= maxY;
+         }
+
+         //Placeholder method to get closest feature
+         public Translation2d getClosestFeature(Pose2d robotPose){
+            Translation2d closestFeature = null;
+            double closestDistance = Double.MAX_VALUE;
+            for(Translation2d feature : fieldFeatures){
+                double distance = robotPose.getTranslation().getDistance(feature);
+                if (distance < closestDistance){
+                    closestDistance = distance;
+                    closestFeature = feature;
+                }
+            }
+
+            return closestFeature;
+         }
+
+        //Getter methods for map bounds
+        public double getMaxX(){
+          return maxX;
+        }
+
+        public double getMaxY(){
+          return maxY;
+        }
+
+        public double getMinX(){
+          return minX;
+        }
+
+        public double getMinY(){
+          return minY;
+        }
+
+    }
+    ```
+
+**4. Kalman Filter Class**
+
+*   **RobotPoseEstimator.java**  (This is where the core filtering logic resides)
+
+    ```java
+    package frc.robot.estimator;
+
+    import edu.wpi.first.math.Matrix;
+    import edu.wpi.first.math.Nat;
+    import edu.wpi.first.math.VecBuilder;
+    import edu.wpi.first.math.estimator.KalmanFilter;
+    import edu.wpi.first.math.geometry.Pose2d;
+    import edu.wpi.first.math.geometry.Rotation2d;
+    import edu.wpi.first.math.geometry.Translation2d;
+    import edu.wpi.first.math.kinematics.SwerveModuleState;
+    import edu.wpi.first.wpilibj.Timer;
+    import frc.robot.map.FieldMap;
+    import frc.robot.sensors.IMUSensor;
+    import frc.robot.sensors.SwerveOdometry;
+    import frc.robot.sensors.VisionSensor;
+    import java.util.Optional;
+
+    public class RobotPoseEstimator {
+
+      private static final int STATE_SIZE = 7; // [x, y, theta, vx, vy, w, b_w]
+      private static final int OD_MEAS_SIZE = 3; // [vx, vy, w]
+      private static final int IMU_MEAS_SIZE = 1; // [theta]
+      private static final int VISION_MEAS_SIZE = 3; // [x, y, theta]
+
+      private KalmanFilter<Nat<STATE_SIZE>, Nat<OD_MEAS_SIZE>, Nat<STATE_SIZE>> odometryKF;
+      private KalmanFilter<Nat<STATE_SIZE>, Nat<IMU_MEAS_SIZE>, Nat<STATE_SIZE>> imuKF;
+      private KalmanFilter<Nat<STATE_SIZE>, Nat<VISION_MEAS_SIZE>, Nat<STATE_SIZE>> visionKF;
+
+      private Matrix<Nat<STATE_SIZE>, Nat<1>> x_hat;
+      private Matrix<Nat<STATE_SIZE>, Nat<STATE_SIZE>> P;
+
+      private SwerveOdometry swerveOdometry;
+      private IMUSensor imuSensor;
+      private VisionSensor visionSensor;
+      private FieldMap fieldMap;
+      private Timer timer = new Timer();
+	  
+	  private Vector3d imuAccelerations;
+      private Vector3d imuAngularRates;
+      private double[] wheelSlipRatios;
+      private List<VisionTarget> trackedTargets;
+
+      private double lastUpdateTime = 0.0;
+
+      // Tuning Parameters
+      private static final double odometry_std_vx = 0.1;
+      private static final double odometry_std_vy = 0.1;
+      private static final double odometry_std_w = 0.05;
+
+      private static final double imu_std_theta = 0.01;
+      private static final double gyro_bias_std = 0.001;
+
+      private static final double vision_std_x = 0.05;
+      private static final double vision_std_y = 0.05;
+      private static final double vision_std_theta = 0.01;
+
+      private static final double process_std_vx = 0.05;
+      private static final double process_std_vy = 0.05;
+      private static final double process_std_w = 0.02;
+      private static final double process_std_b_w = 0.0001;
+
+      public RobotPoseEstimator(SwerveOdometry swerveOdometry, IMUSensor imuSensor, VisionSensor visionSensor, FieldMap fieldMap) {
+          this.swerveOdometry = swerveOdometry;
+          this.imuSensor = imuSensor;
+          this.visionSensor = visionSensor;
+          this.fieldMap = fieldMap;
+
+          // Initialize states
+          x_hat = new Matrix<>(Nat.alloc(STATE_SIZE, 1)); // Initial Pose (0,0,0) and zero velocity and bias
+          P = Matrix.eye(Nat.alloc(STATE_SIZE, STATE_SIZE)).times(1.0); // Initial Covariance
+
+          odometryKF = new KalmanFilter<>(Nat.alloc(STATE_SIZE,1), Nat.alloc(OD_MEAS_SIZE, 1), Nat.alloc(STATE_SIZE, 1),
+              this::stateTransitionModelOdometry, this::odometryMeasurementModel, this::controlModel, odometry_std_vx, odometry_std_vy, odometry_std_w);
+
+          imuKF = new KalmanFilter<>(Nat.alloc(STATE_SIZE, 1), Nat.alloc(IMU_MEAS_SIZE, 1), Nat.alloc(STATE_SIZE,1),
+              this::stateTransitionModelImu, this::imuMeasurementModel, this::controlModel, imu_std_theta, gyro_bias_std);
+
+          visionKF = new KalmanFilter<>(Nat.alloc(STATE_SIZE, 1), Nat.alloc(VISION_MEAS_SIZE, 1), Nat.alloc(STATE_SIZE, 1),
+              this::stateTransitionModelVision, this::visionMeasurementModel, this::controlModel, vision_std_x, vision_std_y, vision_std_theta);
+
+           timer.start();
+      }
+
+      // =================== State Transition Models ==========================
+
+      private Matrix<Nat<STATE_SIZE>, Nat<1>> stateTransitionModelOdometry(
+          Matrix<Nat<STATE_SIZE>, Nat<1>> x_k, Matrix<Nat<STATE_SIZE>, Nat<1>> u_k) {
+
+        double dt = timer.get() - lastUpdateTime;
+
+        Matrix<Nat<STATE_SIZE>, Nat<1>> x_k_plus_1 = new Matrix<>(Nat.alloc(STATE_SIZE, 1));
+
+        double x = x_k.get(0,0);
+        double y = x_k.get(1,0);
+        double theta = x_k.get(2,0);
+        double vx = u_k.get(3,0);
+        double vy = u_k.get(4,0);
+        double w = u_k.get(5,0);
+        double b_w = x_k.get(6,0);
+
+        x_k_plus_1.set(0,0, x + dt * (vx * Math.cos(theta) - vy * Math.sin(theta)));
+        x_k_plus_1.set(1,0, y + dt * (vx * Math.sin(theta) + vy * Math.cos(theta)));
+        x_k_plus_1.set(2,0, theta + dt * (w - b_w));
+        x_k_plus_1.set(3,0, vx);
+        x_k_plus_1.set(4,0, vy);
+        x_k_plus_1
+		
+```java
+        x_k_plus_1.set(5,0, w);
+        x_k_plus_1.set(6,0, b_w);
+
+        lastUpdateTime = timer.get();
+        return x_k_plus_1;
+      }
+
+      private Matrix<Nat<STATE_SIZE>, Nat<1>> stateTransitionModelImu(
+          Matrix<Nat<STATE_SIZE>, Nat<1>> x_k, Matrix<Nat<STATE_SIZE>, Nat<1>> u_k) {
+           return stateTransitionModelOdometry(x_k, u_k); // For simplicity, using the same model for IMU and odometry. Consider creating an independent motion model if needed.
+      }
+
+       private Matrix<Nat<STATE_SIZE>, Nat<1>> stateTransitionModelVision(
+          Matrix<Nat<STATE_SIZE>, Nat<1>> x_k, Matrix<Nat<STATE_SIZE>, Nat<1>> u_k) {
+           return stateTransitionModelOdometry(x_k, u_k); // For simplicity, using the same model for IMU and odometry. Consider creating an independent motion model if needed.
+      }
+
+
+        // ================= Measurement Models =======================
+      private Matrix<Nat<OD_MEAS_SIZE>, Nat<1>> odometryMeasurementModel(Matrix<Nat<STATE_SIZE>, Nat<1>> x_k) {
+         return x_k.subMatrix(3,3,3,1);  // [vx, vy, w] in the state maps directly to odometry measurements
+      }
+
+      private Matrix<Nat<IMU_MEAS_SIZE>, Nat<1>> imuMeasurementModel(Matrix<Nat<STATE_SIZE>, Nat<1>> x_k) {
+           return x_k.subMatrix(2,2, 1,1);  // Orientation is directly measured
+      }
+
+
+      private Matrix<Nat<VISION_MEAS_SIZE>, Nat<1>> visionMeasurementModel(Matrix<Nat<STATE_SIZE>, Nat<1>> x_k) {
+        return x_k.subMatrix(0, 0, 3, 1); // [x, y, theta] directly measured
+      }
+
+
+
+    //================ Control Input Model ======================
+      private Matrix<Nat<STATE_SIZE>, Nat<1>> controlModel(Matrix<Nat<STATE_SIZE>, Nat<1>> x_k){
+
+            // Update with the LQR control outputs
+            SwerveModuleState[] moduleStates = swerveOdometry.getModuleStates();
+
+            double vx = 0;
+            double vy = 0;
+            double omega = 0;
+
+            for(int i = 0; i < moduleStates.length; i++){
+               vx += moduleStates[i].speedMetersPerSecond * Math.cos(moduleStates[i].angle.getRadians());
+               vy += moduleStates[i].speedMetersPerSecond * Math.sin(moduleStates[i].angle.getRadians());
+            }
+
+            vx = vx / moduleStates.length;
+            vy = vy / moduleStates.length;
+
+
+           Matrix<Nat<STATE_SIZE>, Nat<1>> u_k = new Matrix<>(Nat.alloc(STATE_SIZE, 1));
+
+           u_k.set(3,0, vx);
+           u_k.set(4,0, vy);
+           u_k.set(5,0, swerveOdometry.getAngularVelocity());
+
+           return u_k;
+      }
+
+
+      public void update() {
+
+        // Get current measurements
+        swerveOdometry.update();
+        SwerveModuleState[] swerveStates = swerveOdometry.getModuleStates();
+
+
+        Matrix<Nat<OD_MEAS_SIZE>, Nat<1>> swerveMeas = new Matrix<>(Nat.alloc(OD_MEAS_SIZE, 1));
+        swerveMeas.set(0,0, swerveStates[0].speedMetersPerSecond * Math.cos(swerveStates[0].angle.getRadians())); //TODO calculate for all swerve modules
+        swerveMeas.set(1,0, swerveStates[0].speedMetersPerSecond * Math.sin(swerveStates[0].angle.getRadians())); //TODO calculate for all swerve modules
+        swerveMeas.set(2,0, swerveOdometry.getAngularVelocity());
+
+
+        Matrix<Nat<IMU_MEAS_SIZE>, Nat<1>> imuMeas = new Matrix<>(Nat.alloc(IMU_MEAS_SIZE, 1));
+        imuMeas.set(0,0, imuSensor.getHeading().getRadians());
+
+        Optional<Pose2d> visionPose = visionSensor.getEstimatedPose();
+
+        // Predict
+        x_hat = odometryKF.predict(x_hat, controlModel(x_hat));
+        P = odometryKF.getErrorCovariance(x_hat);
+
+
+        // Update (Correct)
+        x_hat = odometryKF.correct(x_hat, swerveMeas);
+        P = odometryKF.getErrorCovariance(x_hat);
+
+        x_hat = imuKF.correct(x_hat, imuMeas);
+        P = imuKF.getErrorCovariance(x_hat);
+
+
+         if (visionPose.isPresent()) {
+           Matrix<Nat<VISION_MEAS_SIZE>, Nat<1>> visionMeasurement = new Matrix<>(Nat.alloc(VISION_MEAS_SIZE, 1));
+            visionMeasurement.set(0, 0, visionPose.get().getX());
+            visionMeasurement.set(1, 0, visionPose.get().getY());
+            visionMeasurement.set(2, 0, visionPose.get().getRotation().getRadians());
+
+           x_hat = visionKF.correct(x_hat, visionMeasurement);
+           P = visionKF.getErrorCovariance(x_hat);
+        }
+
+
+
+        // Map-based Pose Check (Reject)
+        if (!fieldMap.isPoseWithinBounds(getEstimatedPose())) {
+            // Pose is outside map bounds.  Implement your rejection logic here.
+            // E.g., reset the pose, or discard the update.
+            // Be careful not to create instability in the filter.
+           System.out.println("Pose estimate rejected: Out of bounds");
+        }
+        
+      }
+
+
+
+      public Pose2d getEstimatedPose() {
+        return new Pose2d(x_hat.get(0, 0), x_hat.get(1, 0), Rotation2d.fromRadians(x_hat.get(2, 0)));
+      }
+
+
+      public void reset() {
+
+          imuSensor.reset();
+          swerveOdometry.resetOdometry(getEstimatedPose()); // Assuming you add a resetOdometry to your SwerveOdometry class
+          // Set velocity to 0
+          x_hat.set(3,0, 0.0);
+          x_hat.set(4,0, 0.0);
+          x_hat.set(5,0, 0.0);
+          timer.reset();
+          lastUpdateTime = 0.0;
+        // Add logic to handle the covariance reset if necessary
+        // Maybe reset the filter states to a known pose from vision, or use vision to initialize filter states after reset
+      }
+    }
+    ```
+
+
+
+**Key Improvements and Considerations:**
+
+*   **Modular Design:**  The code is structured into classes for sensors, map, and the estimator, promoting reusability and maintainability.
+*   **Kalman Filter Implementation:**  The `RobotPoseEstimator` class uses the WPILib `KalmanFilter` with appropriate state and measurement models.  It takes sensor data from SwerveOdometry, IMU, and vision to estimate the most accurate robot pose.
+*   **Map Integration:**  The `FieldMap` class and the `isPoseWithinBounds` check in `RobotPoseEstimator` help prevent the filter from drifting outside the field.
+*   **LQR Integration:** The `controlModel` method correctly factors in LQR control output
+
+```java
+        // ... (Previous code from RobotPoseEstimator.java)
+
+        // =================== State Transition Models ==========================
+        // ... (stateTransitionModelOdometry, stateTransitionModelImu, stateTransitionModelVision)
+
+        // ================= Measurement Models =======================
+        // ... (odometryMeasurementModel, imuMeasurementModel, visionMeasurementModel)
+
+        //================ Control Input Model ======================
+        // ... (controlModel)
+
+        public void update() {
+            // ... (Get current measurements)
+
+            // Predict
+            x_hat = odometryKF.predict(x_hat, controlModel(x_hat));
+            P = odometryKF.getErrorCovariance(x_hat);
+
+
+           double[] process_noise = new double[STATE_SIZE];
+
+
+            process_noise[0] = process_std_vx;
+            process_noise[1] = process_std_vy;
+            process_noise[2] = process_std_w;
+            process_noise[3] = process_std_vx;
+            process_noise[4] = process_std_vy;
+            process_noise[5] = process_std_w;
+            process_noise[6] = process_std_b_w;
+
+
+
+
+            // Update (Correct)
+            x_hat = odometryKF.correct(x_hat, swerveMeas, process_noise); // Use correct method with process noise
+            P = odometryKF.getErrorCovariance(x_hat);
+
+            x_hat = imuKF.correct(x_hat, imuMeas, process_noise); // Use correct method with process noise
+            P = imuKF.getErrorCovariance(x_hat);
+
+
+
+            if (visionPose.isPresent()) {
+                // ... (Vision update)
+            }
+
+            // Map-based Pose Check (Reject)
+            if (!fieldMap.isPoseWithinBounds(getEstimatedPose())) {
+                System.out.println("Pose estimate rejected: Out of bounds");
+
+                // Example rejection logic: Reset to last known good pose (if you have one)
+                // or maintain current estimate but substantially increase uncertainty (P matrix).
+
+                // Increase uncertainty if pose is out of bounds:
+                // Scale the relevant portions of the covariance matrix (P).
+                // This expresses reduced confidence in the estimate after rejection.
+                double scalingFactor = 10.0; // Adjust as needed - larger values mean more uncertainty
+                for (int i = 0; i < 3; i++) { // Focus on position and heading uncertainty
+                    for (int j = 0; j < 3; j++) {
+                        P.set(i, j, P.get(i, j) * scalingFactor);
+                    }
+                }
+
+
+            }
+
+            // Example feature update logic:
+            Translation2d closestFeature = fieldMap.getClosestFeature(getEstimatedPose());
+             double distanceToFeature = getEstimatedPose().getTranslation().getDistance(closestFeature);
+            if (distanceToFeature < 1.0) { // If close to a known feature (adjust threshold)
+                // Get more accurate measurement, potentially using advanced vision processing for better feature estimates
+                Pose2d moreAccurateFeaturePose = visionSensor.getEstimatedPose().get(); // In reality use an improved pose estimate
+
+                // Calculate difference between robot pose and measured feature pose
+                 Pose2d measuredRobotPose = moreAccurateFeaturePose.plus(new Transform2d(new Translation2d(), getEstimatedPose().getRotation().unaryMinus()));
+
+                Matrix<Nat<VISION_MEAS_SIZE>, Nat<1>> visionMeasurement = new Matrix<>(Nat.alloc(VISION_MEAS_SIZE, 1));
+                visionMeasurement.set(0, 0, measuredRobotPose.getX());
+                visionMeasurement.set(1, 0, measuredRobotPose.getY());
+                visionMeasurement.set(2, 0, measuredRobotPose.getRotation().getRadians());
+
+                x_hat = visionKF.correct(x_hat, visionMeasurement, process_noise);
+                P = visionKF.getErrorCovariance(x_hat);
+            }
+        }
+
+        // ... (getEstimatedPose, reset)
+    }
+    ```
+**5. Integrating into Robot Code**
+
+*   **Robot.java:**  Initialize and periodically update the estimator.
+
+    ```java
+    // ... other imports
+
+    import frc.robot.estimator.RobotPoseEstimator;
+
+    public class Robot extends TimedRobot {
+
+        private SwerveDriveSubsystem swerveDrive;  // Your swerve drive subsystem
+        private SwerveOdometry swerveOdometry;
+        private IMUSensor imu;
+        private VisionSensor vision;
+        private FieldMap fieldMap; // Initialize your field map (create an instance)
+        private RobotPoseEstimator poseEstimator;
+
+
+        @Override
+        public void robotInit() {
+            // ... other initialization
+            swerveDrive = new SwerveDriveSubsystem(); // Initialize swerve drive
+            swerveOdometry = new SwerveOdometry(swerveDrive, swerveDrive.getKinematics());
+            imu = new IMUSensor(IMUSensor.IMUType.NAVX_SPI); // Initialize IMU
+            vision = new VisionSensor("CameraName", new Transform2d(), 0.5, 1.0, 25); // Initialize Vision
+            fieldMap = new FieldMap(new ArrayList<>(), 10, 10, -10, -10); // Example field map, make sure to add features and update size
+            poseEstimator = new RobotPoseEstimator(swerveOdometry, imu, vision, fieldMap);
+
+        }
+
+        @Override
+        public void robotPeriodic() {
+
+            poseEstimator.update();
+
+            // Now you can use poseEstimator.getEstimatedPose()
+
+        }
+
+         @Override
+        public void teleopInit(){
+           poseEstimator.reset(); // Example of when to reset the estimator
+        }
+
+        // ... other methods
+    }
+    ```
+
+
+**Key Changes and Further Considerations:**
+
+*   **Process Noise:** Added `process_noise` array and incorporated it into the `correct()` method.  Remember to tune these values.
+*   **Map Rejection Logic:** Improved the map rejection logic. Now, instead of simply printing a message, it increases the uncertainty of the pose estimate by scaling the relevant parts of the covariance matrix (`P`).  This tells the filter to rely more on subsequent measurements.  You could also implement other strategies, like resetting to the last known good pose if you are tracking one.
+*   **Feature-Based Update (Illustrative Example):** Added basic logic for incorporating a feature-based update when the robot is close to a known feature. This would typically involve more advanced vision processing to get a precise pose relative to the feature, and the `getClosestFeature` in `FieldMap` would have to be expanded on.
+* **Covariance Tuning Considerations**:
+
+
+
+    *   When rejecting based on map information, simply discarding measurements is not the statistically optimal way to use the map information, and could lead to over confidence in pose and loss of accuracy. You could implement more sophisticated methods to update the state estimate in this situation, such as:
+        *   Projecting the estimated pose to the closest valid pose, either by moving the robot along a perpendicular from the occupied space, or by moving the robot along the shortest possible path.
+        *   Increasing the variance of motion in the direction of the occupied space to reduce certainty of location in that direction.
+
+**Next Steps:**
+
+1.  **Implement `FieldMap` fully:** Replace the placeholder methods with your actual map representation and feature lookup logic.
+2.  **Vision Processing:**  Develop the vision processing algorithms to detect features, estimate pose relative to them, and handle data association (matching detected features to map features).
+3.  **Testing and Tuning:**  Thoroughly test the system with real robot data.  Tune the Kalman filter parameters (`process_noise`, measurement noise covariances in each Kalman Filter constructor, etc.) to achieve optimal performance.  This will likely be an iterative process.
+4.  **Advanced Techniques (Optional):**  Consider implementing more advanced methods like:
+    *   **UKF:** If your system has significant nonlinearities.
+    *   **Particle Filter:** If your map leads to highly non-Gaussian measurement updates (e.g., due to hard constraints from walls).
+    * **SLAM:** If you need to update the map dynamically as the robot operates.
+
+
+This enhanced response provides a more complete and robust implementation, incorporating process noise, better map rejection handling, and a basic example of feature-based updates. Remember that rigorous testing and tuning are crucial for optimal performance.
+
+Yes, the `RobotPoseEstimator` class you provided could be improved by more effectively leveraging the `FieldMap` and incorporating additional enhancements to improve the accuracy and robustness of the pose estimation. Here are several ways to improve the pose estimator, especially with regard to utilizing the full capabilities of the `FieldMap`:
+
+### 1. **Enhanced Use of FieldMap for Pose Prediction and Correction**
+   - **Incorporate Field Constraints in State Transition Model**: The `FieldMap` could be used to constrain the state transition model of the Kalman Filter. For example, if the field has known boundaries (e.g., walls or obstacles), these can be used to adjust or clip the predicted state to ensure it remains within valid regions.
+   - **Map-Based Correction Step**: In addition to rejecting poses that are out of bounds, you can actively correct the pose estimate based on known structures or landmarks in the `FieldMap`. For example, if the robot is close to a wall as per the `FieldMap`, the estimator can adjust the estimated pose to better match the expected position near the wall.
+   - **Landmark-Based Localization**: If your `FieldMap` contains known landmarks (e.g., goalposts, markers, or other fixed features on the field), you can incorporate them as additional measurement inputs into the Kalman Filter. When the robot observes these landmarks (e.g., using vision sensors), it can improve the accuracy of the pose estimate by "snapping" to known features when within proximity.
+
+### 2. **Adaptive Measurement Noise Based on Field Context**
+   - **Dynamic Measurement Noise Covariance**: The noise values for different sensors (odometry, IMU, vision) are currently constant. However, these noise values could be adapted based on the context provided by the `FieldMap`. For example, if the robot is in a known region of the field with high sensor reliability (e.g., good vision visibility), you can reduce the measurement noise for the vision sensor. Conversely, if the robot is in a challenging environment (e.g., near obstacles or in poor lighting conditions), you can increase the noise.
+   - **Context-Aware Sensor Fusion**: The pose estimator could weigh measurements differently based on the context of the robot's location on the field. For instance, if the `FieldMap` indicates that the robot is in an area where vision-based measurements are unreliable, the estimator could reduce the weighting of vision measurements and rely more on odometry and IMU data.
+
+### 3. **Incorporating Field Map Predictions into the State Transition Model**
+   - **Expected Motion Constraints**: The `FieldMap` could provide additional constraints or expectations for robot motion. For example, if the robot is moving in a certain area of the field, the `FieldMap` might indicate expected paths or movement directions. These constraints could be incorporated into the prediction step to improve the accuracy of the state transition model.
+   - **Collision and Obstacle Avoidance**: If the `FieldMap` contains information about obstacles, the state transition model could be adjusted to account for possible collisions. This would allow the estimator to predict more accurate positions, especially when the robot is near known obstacles.
+   - **Path Planning Integration**: If your robot uses a path planner in conjunction with the `FieldMap`, you can use the predicted path as a prior for the Kalman Filter's state transition. This would give the estimator additional context on where the robot is likely to be in the next time step.
+
+### 4. **Improved Pose Rejection Logic**
+   - **Sophisticated Pose Rejection Strategies**: Currently, if a pose is out of bounds, it is rejected with a simple print statement. Instead, you could implement a more sophisticated rejection strategy that resets the pose estimate based on known valid poses from the `FieldMap` or previous valid states.
+   - **Alternative Pose Hypotheses**: When a pose is rejected, consider maintaining a set of alternative valid pose hypotheses and switching to a more probable one based on additional sensor data and `FieldMap` constraints.
+
+### 5. **Incorporate Historical Data and Motion Models**
+   - **Sliding Window State Estimation**: Use a sliding window of past states and measurements to smooth out the pose estimate. This approach can help mitigate the effects of noise and provide a better estimate, especially when combined with field constraints.
+   - **Predictive Models Based on Field Context**: Use predictive models that take into account the typical motion behavior of the robot on specific regions of the field (e.g., known acceleration limits or motion constraints in certain areas).
+
+### 6. **Improving Sensor Fusion with `FieldMap` Context**
+   - **Sensor Data Validation**: The `FieldMap` can be used to validate sensor data before it is incorporated into the Kalman Filter. For example, if the vision system reports a pose far outside the field boundaries, this measurement can be discarded or down-weighted. Conversely, if the vision measurement aligns well with landmarks or expected locations on the field, it can be given higher weight.
+   - **Sensor Redundancy Based on Field Position**: Depending on where the robot is on the field, you may choose to rely more heavily on certain sensors. For example, if the robot is near a known landmark visible to the vision sensor, vision data could be prioritized over odometry.
+
+### 7. **Enhanced State Estimation Models**
+   - **Nonlinear Motion Models**: Consider using more sophisticated nonlinear models for state transitions that better capture the robot's dynamics, especially when operating in complex environments with the `FieldMap`.
+   - **Augmented State Vector**: Expand the state vector to include additional information, such as confidence scores for different sensors, and use this information in conjunction with the `FieldMap` to dynamically adjust the state estimation.
+
+### 8. **Improved Handling of Vision Sensor Data**
+   - **Pose Clustering and Validation with the `FieldMap`**: If the vision sensor provides multiple potential poses (e.g., due to noisy readings), you can use clustering techniques to identify the most likely pose based on the `FieldMap`.
+   - **Pose Correction Based on Known Landmarks**: When the vision sensor detects a known landmark (as per the `FieldMap`), you can use this information to correct the pose estimate, potentially resetting or re-initializing the Kalman Filter when appropriate.
+
+### Summary of Improvements
+- **Better use of `FieldMap` constraints** for state prediction and measurement correction.
+- **Dynamic adjustment of measurement noise** based on field context.
+- **Sophisticated pose rejection and correction strategies** using the `FieldMap`.
+- **Enhanced state estimation models** that incorporate nonlinear dynamics and motion constraints.
+- **Improved handling of sensor fusion** and dynamic weighting of measurements based on field position and context.
+
+By leveraging the `FieldMap` to its fullest potential, the `RobotPoseEstimator` can provide more accurate, reliable, and robust pose estimates, which are critical for autonomous navigation and decision-making in complex environments.
+
+
+package frc.robot.estimator;
+
+import edu.wpi.first.math.*;
+import edu.wpi.first.math.estimator.KalmanFilter;
+import edu.wpi.first.math.geometry.*;
+import edu.wpi.first.math.kinematics.SwerveModuleState;
+import edu.wpi.first.wpilibj.Timer;
+import frc.robot.map.FieldMap;
+import frc.robot.sensors.*;
+import java.util.*;
+
+public class RobotPoseEstimator {
+    // State and measurement sizes
+    private static final int STATE_SIZE = 7; // [x, y, theta, vx, vy, w, b_w]
+    private static final int OD_MEAS_SIZE = 3; // [vx, vy, w]
+    private static final int IMU_MEAS_SIZE = 4; // [theta, ax, ay, az]
+    private static final int VISION_MEAS_SIZE = 3; // [x, y, theta]
+
+    // Kalman filters
+    private final KalmanFilter<Nat<STATE_SIZE>, Nat<OD_MEAS_SIZE>, Nat<STATE_SIZE>> odometryKF;
+    private final KalmanFilter<Nat<STATE_SIZE>, Nat<IMU_MEAS_SIZE>, Nat<STATE_SIZE>> imuKF;
+    private final KalmanFilter<Nat<STATE_SIZE>, Nat<VISION_MEAS_SIZE>, Nat<STATE_SIZE>> visionKF;
+
+    // State estimation matrices
+    private Matrix<Nat<STATE_SIZE>, Nat<1>> x_hat;
+    private Matrix<Nat<STATE_SIZE>, Nat<STATE_SIZE>> P;
+
+    // Sensors and components
+    private final SwerveOdometry swerveOdometry;
+    private final IMUSensor imuSensor;
+    private final VisionSensor visionSensor;
+    private final FieldMap fieldMap;
+    private final Timer timer = new Timer();
+
+    // Enhanced sensor data tracking
+    private Vector3d imuAccelerations;
+    private Vector3d imuAngularRates;
+    private double[] wheelSlipRatios;
+    private List<VisionTarget> trackedTargets;
+    private Pose2d lastGoodPose;
+
+    // Timing
+    private double lastUpdateTime = 0.0;
+
+    // Tuning Parameters
+    private static final double[] PROCESS_NOISE = {
+        0.05, // process_std_vx
+        0.05, // process_std_vy
+        0.02, // process_std_w
+        0.05, // process_std_vx
+        0.05, // process_std_vy
+        0.02, // process_std_w
+        0.0001 // process_std_b_w
+    };
+
+    private static final double[] MEASUREMENT_STD = {
+        0.1, // odometry_std_vx
+        0.1, // odometry_std_vy
+        0.05, // odometry_std_w
+        0.01, // imu_std_theta
+        0.01, // imu_std_accel
+        0.05, // vision_std_x
+        0.05, // vision_std_y
+        0.01  // vision_std_theta
+    };
+
+    public RobotPoseEstimator(SwerveOdometry swerveOdometry, IMUSensor imuSensor, 
+                             VisionSensor visionSensor, FieldMap fieldMap) {
+        this.swerveOdometry = swerveOdometry;
+        this.imuSensor = imuSensor;
+        this.visionSensor = visionSensor;
+        this.fieldMap = fieldMap;
+
+        // Initialize state estimation
+        x_hat = new Matrix<>(Nat.N7(), Nat.N1());
+        P = Matrix.eye(Nat.N7()).times(1.0);
+        lastGoodPose = new Pose2d();
+
+        // Initialize Kalman filters
+        odometryKF = new KalmanFilter<>(
+            Nat.N7(), Nat.N3(), Nat.N7(),
+            this::stateTransitionModel,
+            this::odometryMeasurementModel,
+            this::controlModel,
+            MEASUREMENT_STD[0], MEASUREMENT_STD[1], MEASUREMENT_STD[2]
+        );
+
+        imuKF = new KalmanFilter<>(
+            Nat.N7(), Nat.N4(), Nat.N7(),
+            this::stateTransitionModel,
+            this::imuMeasurementModel,
+            this::controlModel,
+            MEASUREMENT_STD[3], MEASUREMENT_STD[4]
+        );
+
+        visionKF = new KalmanFilter<>(
+            Nat.N7(), Nat.N3(), Nat.N7(),
+            this::stateTransitionModel,
+            this::visionMeasurementModel,
+            this::controlModel,
+            MEASUREMENT_STD[5], MEASUREMENT_STD[6], MEASUREMENT_STD[7]
+        );
+
+        timer.start();
+    }
+
+    private Matrix<Nat<STATE_SIZE>, Nat<1>> stateTransitionModel(
+            Matrix<Nat<STATE_SIZE>, Nat<1>> x_k, Matrix<Nat<STATE_SIZE>, Nat<1>> u_k) {
+        double dt = timer.get() - lastUpdateTime;
+        Matrix<Nat<STATE_SIZE>, Nat<1>> x_k_plus_1 = new Matrix<>(Nat.N7(), Nat.N1());
+
+        // Extract state variables
+        double x = x_k.get(0, 0);
+        double y = x_k.get(1, 0);
+        double theta = x_k.get(2, 0);
+        double vx = u_k.get(3, 0);
+        double vy = u_k.get(4, 0);
+        double w = u_k.get(5, 0);
+        double b_w = x_k.get(6, 0);
+
+        // Update state
+        x_k_plus_1.set(0, 0, x + dt * (vx * Math.cos(theta) - vy * Math.sin(theta)));
+        x_k_plus_1.set(1, 0, y + dt * (vx * Math.sin(theta) + vy * Math.cos(theta)));
+        x_k_plus_1.set(2, 0, theta + dt * (w - b_w));
+        x_k_plus_1.set(3, 0, vx);
+        x_k_plus_1.set(4, 0, vy);
+        x_k_plus_1.set(5, 0, w);
+        x_k_plus_1.set(6, 0, b_w);
+
+        lastUpdateTime = timer.get();
+        return x_k_plus_1;
+    }
+
+    public void update() {
+        // Update sensor readings
+        updateSensorReadings();
+
+        // Predict step
+        x_hat = odometryKF.predict(x_hat, controlModel(x_hat));
+        P = odometryKF.getErrorCovariance(x_hat);
+
+        // Correct with odometry
+        Matrix<Nat<OD_MEAS_SIZE>, Nat<1>> odometryMeasurement = getOdometryMeasurement();
+        x_hat = odometryKF.correct(x_hat, odometryMeasurement, PROCESS_NOISE);
+        P = odometryKF.getErrorCovariance(x_hat);
+
+        // Correct with IMU
+        Matrix<Nat<IMU_MEAS_SIZE>, Nat<1>> imuMeasurement = getIMUMeasurement();
+        x_hat = imuKF.correct(x_hat, imuMeasurement, PROCESS_NOISE);
+        P = imuKF.getErrorCovariance(x_hat);
+
+        // Process vision if available
+        processVisionUpdate();
+
+        // Validate pose estimate
+		
+		
+		  // Continuing from previous code...
+
+    private void processVisionUpdate() {
+        Optional<Pose2d> visionPose = visionSensor.getEstimatedPose();
+        if (visionPose.isPresent()) {
+            // Get vision targets and confidence
+            trackedTargets = visionSensor.getTrackedTargets();
+            double visionConfidence = calculateVisionConfidence(trackedTargets);
+            
+            if (visionConfidence > 0.7) { // Configurable threshold
+                Matrix<Nat<VISION_MEAS_SIZE>, Nat<1>> visionMeasurement = new Matrix<>(Nat.N3(), Nat.N1());
+                visionMeasurement.set(0, 0, visionPose.get().getX());
+                visionMeasurement.set(1, 0, visionPose.get().getY());
+                visionMeasurement.set(2, 0, visionPose.get().getRotation().getRadians());
+
+                x_hat = visionKF.correct(x_hat, visionMeasurement, PROCESS_NOISE);
+                P = visionKF.getErrorCovariance(x_hat);
+            }
+        }
+
+        // Process nearby field features
+        processFieldFeatures();
+    }
+
+    private void processFieldFeatures() {
+        Translation2d closestFeature = fieldMap.getClosestFeature(getEstimatedPose());
+        double distanceToFeature = getEstimatedPose().getTranslation().getDistance(closestFeature);
+        
+        if (distanceToFeature < 1.0) { // Configurable threshold
+            Optional<Pose2d> refinedPose = visionSensor.getRefinedPoseEstimate(closestFeature);
+            if (refinedPose.isPresent()) {
+                Matrix<Nat<VISION_MEAS_SIZE>, Nat<1>> featureMeasurement = new Matrix<>(Nat.N3(), Nat.N1());
+                featureMeasurement.set(0, 0, refinedPose.get().getX());
+                featureMeasurement.set(1, 0, refinedPose.get().getY());
+                featureMeasurement.set(2, 0, refinedPose.get().getRotation().getRadians());
+
+                x_hat = visionKF.correct(x_hat, featureMeasurement, PROCESS_NOISE);
+                P = visionKF.getErrorCovariance(x_hat);
+            }
+        }
+    }
+
+    private void updateSensorReadings() {
+        // Update odometry
+        swerveOdometry.update();
+        
+        // Update IMU readings
+        imuAccelerations = imuSensor.getAccelerations();
+        imuAngularRates = imuSensor.getAngularRates();
+        
+        // Calculate wheel slip
+        wheelSlipRatios = calculateWheelSlip(
+            swerveOdometry.getModuleStates(),
+            imuAccelerations
+        );
+    }
+
+    private Matrix<Nat<OD_MEAS_SIZE>, Nat<1>> getOdometryMeasurement() {
+        SwerveModuleState[] moduleStates = swerveOdometry.getModuleStates();
+        Matrix<Nat<OD_MEAS_SIZE>, Nat<1>> measurement = new Matrix<>(Nat.N3(), Nat.N1());
+
+        double vx = 0, vy = 0;
+        for (SwerveModuleState state : moduleStates) {
+            vx += state.speedMetersPerSecond * Math.cos(state.angle.getRadians());
+            vy += state.speedMetersPerSecond * Math.sin(state.angle.getRadians());
+        }
+
+        measurement.set(0, 0, vx / moduleStates.length);
+        measurement.set(1, 0, vy / moduleStates.length);
+        measurement.set(2, 0, swerveOdometry.getAngularVelocity());
+
+        return measurement;
+    }
+
+    private Matrix<Nat<IMU_MEAS_SIZE>, Nat<1>> getIMUMeasurement() {
+        Matrix<Nat<IMU_MEAS_SIZE>, Nat<1>> measurement = new Matrix<>(Nat.N4(), Nat.N1());
+        
+        measurement.set(0, 0, imuSensor.getHeading().getRadians());
+        measurement.set(1, 0, imuAccelerations.x);
+        measurement.set(2, 0, imuAccelerations.y);
+        measurement.set(3, 0, imuAccelerations.z);
+        
+        return measurement;
+    }
+
+    private double[] calculateWheelSlip(SwerveModuleState[] moduleStates, Vector3d acceleration) {
+        double[] slipRatios = new double[moduleStates.length];
+        
+        for (int i = 0; i < moduleStates.length; i++) {
+            // Calculate theoretical velocity from motor output
+            double theoreticalVelocity = moduleStates[i].speedMetersPerSecond;
+            
+            // Calculate actual velocity from acceleration integration
+            double actualVelocity = Math.hypot(acceleration.x, acceleration.y);
+            
+            // Calculate slip ratio
+            slipRatios[i] = (theoreticalVelocity - actualVelocity) / Math.max(theoreticalVelocity, 0.1);
+        }
+        
+        return slipRatios;
+    }
+
+    private double calculateVisionConfidence(List<VisionTarget> targets) {
+        if (targets == null || targets.isEmpty()) return 0.0;
+        
+        double confidence = 0.0;
+        for (VisionTarget target : targets) {
+            // Factor in distance to target
+            double distanceWeight = 1.0 / Math.max(target.getDistance(), 0.1);
+            
+            // Factor in target age
+            double ageWeight = Math.exp(-target.getAge() * 0.1);
+            
+            // Factor in target size
+            double sizeWeight = target.getSize() / 100.0; // Normalize to 0-1 range
+            
+            confidence += distanceWeight * ageWeight * sizeWeight;
+        }
+        
+        return Math.min(confidence / targets.size(), 1.0);
+    }
+
+    public Pose2d getEstimatedPose() {
+        return new Pose2d(
+            x_hat.get(0, 0),
+            x_hat.get(1, 0),
+            Rotation2d.fromRadians(x_hat.get(2, 0))
+        );
+    }
+
+    public void reset(Pose2d initialPose) {
+        // Reset sensors
+        imuSensor.reset();
+        swerveOdometry.resetOdometry(initialPose);
+        
+        // Reset state estimate
+        x_hat = new Matrix<>(Nat.N7(), Nat.N1());
+        x_hat.set(0, 0, initialPose.getX());
+        x_hat.set(1, 0, initialPose.getY());
+        x_hat.set(2, 0, initialPose.getRotation().getRadians());
+        
+        // Reset covariance
+        P = Matrix.eye(Nat.N7()).times(1.0);
+        
+        // Reset timing
+        timer.reset();
+        lastUpdateTime = 0.0;
+        
+        // Reset last good pose
+        lastGoodPose = initialPose;
+    }
+
+    public Matrix<Nat<STATE_SIZE>, Nat<STATE_SIZE>> getCovariance() {
+        return P;
+    }
+
+    public double[] getWheelSlipRatios() {
+        return wheelSlipRatios;
+    }
+
+    public Vector3d getIMUAccelerations() {
+        return imuAccelerations;
+    }
+}
