@@ -1,6 +1,8 @@
 package frc.robot.DriveBase;
 
 import edu.wpi.first.math.geometry.Rotation2d;
+import edu.wpi.first.units.Distance;
+import edu.wpi.first.units.Measure;
 import edu.wpi.first.units.Unit;
 import edu.wpi.first.units.Units;
 import frc.robot.Devices.*;
@@ -34,6 +36,10 @@ public class SwerveModule {
 
   public Rotation2d getAngle() {
     return Rotation2d.fromRadians(this.steer.getAngle().in(Units.Radians));
+  }
+
+  public Measure<Distance> getPosition(){
+    return drive.getPosition();
   }
 
   public double getWheelVelMPS() {
