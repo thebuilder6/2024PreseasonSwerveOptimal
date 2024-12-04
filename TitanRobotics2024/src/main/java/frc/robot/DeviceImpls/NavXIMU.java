@@ -3,6 +3,11 @@ package frc.robot.DeviceImpls;
 
 import com.kauailabs.navx.frc.AHRS;
 import edu.wpi.first.math.geometry.Rotation2d;
+import edu.wpi.first.units.Units;
+import edu.wpi.first.units.Angle;
+import edu.wpi.first.units.Distance;
+import edu.wpi.first.units.Measure;
+import edu.wpi.first.units.Velocity;
 import edu.wpi.first.wpilibj.SPI;
 import frc.robot.Devices.IMUInterface;
 
@@ -25,19 +30,21 @@ public class NavXIMU implements IMUInterface {
             }
 
             // Convert accelerations from G's to m/s^2
-            double accelX = navX.getRawAccelX() * 9.81;
-            double accelY = navX.getRawAccelY() * 9.81;
-            double accelZ = navX.getRawAccelZ() * 9.81;
+            Measure<Velocity<Velocity<Distance>>> accelX = Units.MetersPerSecondPerSecond.of(navX.getRawAccelX() * 9.81);
+            Measure<Velocity<Velocity<Distance>>> accelY = Units.MetersPerSecondPerSecond.of(navX.getRawAccelY() * 9.81);
+            Measure<Velocity<Velocity<Distance>>> accelZ = Units.MetersPerSecondPerSecond.of(navX.getRawAccelZ() * 9.81);
 
-            // Get raw gyro rates in rad/s
-            double gyroX = Math.toRadians(navX.getRawGyroX());
-            double gyroY = Math.toRadians(navX.getRawGyroY());
-            double gyroZ = Math.toRadians(navX.getRawGyroZ());
+            // Get gyro yaw pitch roll
+            Measure<Angle> gyroPitch = Units.Degrees.of(navX.getPitch());
+            Measure<Angle> gyroRoll = Units.Degrees.of(navX.getRoll());
+            Measure<Angle> gyroYaw = Units.Degrees.of(navX.getYaw());
+            Measure<Velocity<Angle>> yawRate = Units.DegreesPerSecond.of(navX.getRate());
 
             // Apply mount corrections
             IMUMeasurement measurement = new IMUMeasurement(
                 accelX, accelY, accelZ,
-                gyroX, gyroY, gyroZ,
+                gyroPitch, gyroRoll, gyroYaw,
+                yawRate, 
                 getAdjustedHeading(),
                 navX.getLastSensorTimestamp() * 1e-6  // Convert microseconds to seconds
             );
@@ -69,7 +76,7 @@ public class NavXIMU implements IMUInterface {
     }
 
     private Rotation2d getAdjustedHeading() {
-        return Rotation2d.fromDegrees(navX.getYaw())
+        return Rotation2d.fromDegrees(navX.getFusedHeading())
             .plus(mountConfig.yawOffset);
     }
 }

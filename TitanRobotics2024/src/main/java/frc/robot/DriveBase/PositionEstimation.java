@@ -7,9 +7,7 @@ import edu.wpi.first.math.geometry.Pose2d;
 import edu.wpi.first.math.geometry.Rotation2d;
 import edu.wpi.first.math.kinematics.SwerveDriveKinematics;
 import edu.wpi.first.math.kinematics.SwerveModuleState;
-import edu.wpi.first.math.numbers.N1;
-import edu.wpi.first.math.numbers.N2;
-import edu.wpi.first.math.numbers.N7;
+import edu.wpi.first.math.numbers.*;
 import edu.wpi.first.wpilibj.Timer;
 import frc.robot.Devices.IMUInterface;
 import frc.robot.Devices.IMUInterface.IMUMeasurement;
@@ -18,6 +16,11 @@ import frc.robot.Devices.OdometryInterface.OdometryMeasurement;
 import frc.robot.Data.*;
 import edu.wpi.first.math.geometry.Translation2d;
 import edu.wpi.first.math.geometry.Twist2d;
+import edu.wpi.first.math.estimator.KalmanFilter;
+import edu.wpi.first.math.system.NumericalIntegration;
+import edu.wpi.first.math.system.plant.LinearSystemId;
+import edu.wpi.first.units.Unit;
+import edu.wpi.first.units.Units;
 
 import java.util.Optional;
 import frc.robot.Devices.VisionInterface;
@@ -40,6 +43,8 @@ public class PositionEstimation {
     private Matrix<N7,N1> stateEstimate; // Current state estimate // [x, y, theta, vx, vy, omega, bias_omega]
     private Matrix<N7,N7>stateCovariance; // State uncertainty
     private Pose2d lastValidPose;
+
+    private final KalmanFilter<N7, N3, N5> kalmanFilter;
 
     // Measurement tracking
     private double lastUpdateTime;
@@ -91,6 +96,34 @@ public class PositionEstimation {
         this.imu = imu;
         this.odometry = odometry;
         this.vision = vision;
+
+        // Define system matrices
+        var A = Matrix.eye(Nat.N7());
+        var B = new Matrix<>(Nat.N7(), Nat.N3());
+        var C = new Matrix<>(Nat.N5(), Nat.N7());  // Measurement matrix for odometry
+        var Q = Matrix.eye(Nat.N7()).times(0.1);   // Process noise
+        var R = Matrix.eye(Nat.N5()).times(0.1);   // Measurement noise for odometry
+
+
+                // Populate A, B, C matrices
+        // Example: Adding time step dt into position and velocity updates
+        double dt = 0.02; // 20 ms loop time
+        A.set(0, 3, dt); // x += vx * dt
+        A.set(1, 4, dt); // y += vy * dt
+        A.set(2, 5, dt); // theta += omega * dt
+        B.set(3, 0, 1.0); // vx control input
+        B.set(4, 1, 1.0); // vy control input
+        B.set(5, 2, 1.0); // omega control input
+        C.set(0, 3, 1.0); // vx measurement
+        C.set(1, 4, 1.0); // vy measurement
+        C.set(2, 5, 1.0); // omega measurement
+        C.set(3, 0, 1.0); // x measurement
+        C.set(4, 1, 1.0); // y measurement
+
+        // Initialize the Kalman Filter
+        kalmanFilter = new KalmanFilter<>(Nat.N7(), Nat.N5(), A, B, C, Q, R, dt);
+
+
         this.timer = new Timer();
         this.noiseParams = new NoiseParameters();
         // Initialize state estimation
@@ -108,15 +141,22 @@ public class PositionEstimation {
     public void update() {
         double currentTime = timer.get();
         double dt = currentTime - lastUpdateTime;
-
-        // 1. Prediction step
-        predict(dt);
-
-        // 2. Process available measurements
+    
+        // Control inputs
+        var u = new Matrix<>(Nat.N3(), Nat.N1());
+        u.set(0, 0, lastControlInput.vxCommand);
+        u.set(1, 0, lastControlInput.vyCommand);
+        u.set(2, 0, lastControlInput.omegaCommand);
+    
+        // Prediction step
+        kalmanFilter.predict(u, dt);
+    
+        // Process measurements
         processMeasurements();
-
+    
         lastUpdateTime = currentTime;
     }
+
 
     /**
      * Performs the prediction step of the Kalman filter
@@ -231,13 +271,14 @@ public class PositionEstimation {
         IMUInterface.MountConfiguration mountConfig = imu.getMountConfiguration();
 
         // Transform accelerations to robot frame
+        // do we need this? values for IMU are in robot relative pose is field relative  
         double robotHeading = stateEstimate.get(2, 0);
         double cosHeading = Math.cos(robotHeading + mountConfig.yawOffset.getRadians());
         double sinHeading = Math.sin(robotHeading + mountConfig.yawOffset.getRadians());
 
-        // Apply coordinate transformation
-        double robotAccelX = measurement.rawAccelX * cosHeading - measurement.rawAccelY * sinHeading;
-        double robotAccelY = measurement.rawAccelX * sinHeading + measurement.rawAccelY * cosHeading;
+        // Apply coordinate transformation 
+        double robotAccelX = measurement.rawAccelX.in(Units.MetersPerSecondPerSecond) * cosHeading - measurement.rawAccelY.in(Units.MetersPerSecondPerSecond) * sinHeading;
+        double robotAccelY = measurement.rawAccelX.in(Units.MetersPerSecondPerSecond) * sinHeading + measurement.rawAccelY.in(Units.MetersPerSecondPerSecond) * cosHeading;
 
         // Create measurement matrix for IMU
         var H = new Matrix<>(Nat.N4(), Nat.N7());
@@ -254,13 +295,15 @@ public class PositionEstimation {
         R.set(1, 1, noiseParams.imuAccelNoise);
         R.set(2, 2, noiseParams.imuAccelNoise);
         R.set(3, 3, noiseParams.imuHeadingNoise);
-
-        // Create measurement vector
+        
+        // Create measurement matrix (z)
         var z = new Matrix<>(Nat.N4(), Nat.N1());
         z.set(0, 0, measurement.heading.getRadians());
         z.set(1, 0, robotAccelX);
         z.set(2, 0, robotAccelY);
-        z.set(3, 0, measurement.rawGyroZ);
+        z.set(3, 0, measurement.yawRate.in(Units.RadiansPerSecond));
+    
+        
 
         // Check for significant acceleration or rotation
         double accelMagnitude = Math.sqrt(robotAccelX * robotAccelX + robotAccelY * robotAccelY);
@@ -270,16 +313,18 @@ public class PositionEstimation {
             R.set(2, 2, R.get(2, 2) * 2.0);
         }
 
-        if (Math.abs(measurement.rawGyroZ) > MAX_ROTATION_RATE / 2) {
+        if (Math.abs(measurement.yawRate.in(Units.RadiansPerSecond)) > MAX_ROTATION_RATE / 2) {
             // Increase rotation measurement noise during high rotation
             R.set(3, 3, R.get(3, 3) * 2.0);
         }
 
         // Update gyro bias estimate
-        updateGyroBias(measurement.rawGyroZ, stateEstimate.get(5, 0));
-
+        updateGyroBias(measurement.yawRate.in(Units.RadiansPerSecond), stateEstimate.get(5, 0));
+        
+        // Update Kalman filter
+        kalmanFilter.correct(C_imu, z, R);
         // Perform update
-        updateKalman(z, H, R);
+        //updateKalman(z, H, R);
     }
 
     /**
@@ -326,16 +371,20 @@ public class PositionEstimation {
      
      
             if (slipResult.isSlipping() && slipResult.confidence() > 0.5) { // Example threshold
-                System.out.println("Slip detected! Confidence: " + slipResult.confidence());
+                System.out.println("Slip detected! Confidence: " + slipResult.confidence() + " Adjusting noise...");
                 // Implement slip handling logic here, e.g.,
                 // - Reduce trust in odometry measurements by increasing the odometry noise in the R matrix
                 // - Correct the state estimate using the slip velocity
                 // - Trigger other actions based on slip detection
+                R.set(0, 0, R.get(0, 0) * 2.0); // Increase odometry noise for x velocity
+                R.set(1, 1, R.get(1, 1) * 2.0); // Increase odometry noise for y velocity
             }
         }
-
+        
+        // Update Kalman filter
+        kalmanFilter.correct(C_odometry, z, R);
         // Perform update
-        updateKalman(z, H, R);
+        // updateKalman(z, H, R);
     }
 
     /**
@@ -428,10 +477,12 @@ public class PositionEstimation {
      * @return The estimated Pose2d
      */
     public Pose2d getEstimatedPose() {
+        var state = kalmanFilter.getXhat();
         return new Pose2d(
-                stateEstimate.get(0, 0),
-                stateEstimate.get(1, 0),
-                Rotation2d.fromRadians(stateEstimate.get(2, 0)));
+            state.get(0, 0),
+            state.get(1, 0),
+            Rotation2d.fromRadians(state.get(2, 0))
+        );
     }
 
     /**
@@ -584,10 +635,10 @@ public class PositionEstimation {
         // Use appropriate rotation calculation
         double expectedAngularVelocity = odometryTwist.dtheta / dt;
 
-        double accelDiffX = Math.abs(imuMeasurement.rawAccelX - expectedAccelX);
-        double accelDiffY = Math.abs(imuMeasurement.rawAccelY - expectedAccelY);
+        double accelDiffX = Math.abs(imuMeasurement.rawAccelX.in(Units.MetersPerSecondPerSecond) - expectedAccelX);
+        double accelDiffY = Math.abs(imuMeasurement.rawAccelY.in(Units.MetersPerSecondPerSecond) - expectedAccelY);
 
-        double gyroDiff = Math.abs(imuMeasurement.rawGyroZ - expectedAngularVelocity);
+        double gyroDiff = Math.abs(imuMeasurement.yawRate.in(Units.RadiansPerSecond) - expectedAngularVelocity);
 
         boolean imuSlip = accelDiffX > SLIP_ACCEL_THRESHOLD || accelDiffY > SLIP_ACCEL_THRESHOLD
                 || gyroDiff > HEADING_DIFF_THRESHOLD;

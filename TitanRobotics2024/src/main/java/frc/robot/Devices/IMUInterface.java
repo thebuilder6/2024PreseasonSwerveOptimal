@@ -21,10 +21,11 @@ public interface IMUInterface {
         public final Measure<Velocity<Velocity<Distance>>> rawAccelX;    // m/s^2
         public final Measure<Velocity<Velocity<Distance>>> rawAccelY;    // m/s^2
         public final Measure<Velocity<Velocity<Distance>>> rawAccelZ;    // m/s^2
-        public final Measure<Velocity<Angle>> rawGyroX;     // rad/s
-        public final Measure<Velocity<Angle>> rawGyroY;     // rad/s
-        public final Measure<Velocity<Angle>> rawGyroZ;     // rad/s
-        
+        public final Measure<Angle> gyroPitch;     
+        public final Measure<Angle> gyroRoll;     
+        public final Measure<Angle> gyroYaw;
+        public final Measure<Velocity<Angle>> yawRate;
+
         // Processed measurements
         public final Rotation2d heading;   // Current heading
         public final double timestamp;     // When measurement was taken
@@ -33,16 +34,18 @@ public interface IMUInterface {
                 Measure<Velocity<Velocity<Distance>>> rawAccelX, 
                 Measure<Velocity<Velocity<Distance>>> rawAccelY, 
                 Measure<Velocity<Velocity<Distance>>> rawAccelZ,
-                Measure<Velocity<Angle>> rawGyroX, 
-                Measure<Velocity<Angle>> rawGyroY, 
-                Measure<Velocity<Angle>> rawGyroZ,
+                Measure<Angle> gyroPitch, 
+                Measure<Angle> gyroRoll, 
+                Measure<Angle> gyroYaw,
+                Measure<Velocity<Angle>> yawRate,
                 Rotation2d heading, double timestamp) {
             this.rawAccelX = rawAccelX;
             this.rawAccelY = rawAccelY;
             this.rawAccelZ = rawAccelZ;
-            this.rawGyroX = rawGyroX;
-            this.rawGyroY = rawGyroY;
-            this.rawGyroZ = rawGyroZ;
+            this.gyroPitch = gyroPitch;
+            this.gyroRoll = gyroRoll;
+            this.gyroYaw = gyroYaw;
+            this.yawRate = yawRate;
             this.heading = heading;
             this.timestamp = timestamp;
         }
